@@ -1,76 +1,82 @@
-import time
-from collections import defaultdict
 from scapy.all import sniff, IP, TCP, UDP
 from sklearn.ensemble import IsolationForest
-import numpy as np
+import time
+from collections import defaultdict
 
-# ------------------------------------------------------------------
-# 1. Feature extraction: we collect stats per source IP every window
-# ------------------------------------------------------------------
-# Data structure: { src_ip: [list_of_features] }
-# Features: [packet_count, unique_dst_ports, avg_packet_rate]
-ip_stats = defaultdict(lambda: {'packets': 0, 'ports': set(), 'start_time': time.time()})
+# --------------------------------------------------
+# 1. Store stats per source IP
+# --------------------------------------------------
+# ip_stats[src_ip] = {'packets': count, 'ports': set(), 'start_time': timestamp}
+ip_stats = defaultdict(
+    lambda: {"packets": 0, "ports": set(), "start_time": time.time()}
+)
 
-# Detection window (seconds) – after each window we run ML
-WINDOW = 10
+WINDOW = 10  # check for anomalies every 10 seconds
 
-def extract_features():
-    """Convert collected stats into a numpy array for ML."""
-    X = []
-    ip_list = []
-    current_time = time.time()
+
+# --------------------------------------------------
+# 2. Packet callback: update stats for each packet
+# --------------------------------------------------
+def packet_callback(packet):
+    if IP in packet:  # only IP packets
+        src = packet[IP].src  # source IP address
+        ip_stats[src]["packets"] += 1
+        # record destination port if TCP or UDP
+        if TCP in packet:
+            ip_stats[src]["ports"].add(packet[TCP].dport)
+        elif UDP in packet:
+            ip_stats[src]["ports"].add(packet[UDP].dport)
+
+
+# --------------------------------------------------
+# 3. Build feature list from collected stats
+# --------------------------------------------------
+def get_features():
+    X = []  # list of feature vectors
+    ip_list = []  # keep IPs in same order
+    now = time.time()
     for ip, data in ip_stats.items():
-        elapsed = current_time - data['start_time']
-        if elapsed == 0:
+        elapsed = now - data["start_time"]
+        if elapsed < 0.001:
             elapsed = 0.001
-        packet_rate = data['packets'] / elapsed
-        # Feature vector: [packet_count, unique_ports, packet_rate]
-        features = [data['packets'], len(data['ports']), packet_rate]
+        rate = data["packets"] / elapsed
+        features = [data["packets"], len(data["ports"]), rate]
         X.append(features)
         ip_list.append(ip)
-    return np.array(X), ip_list
+    return X, ip_list
 
+
+# --------------------------------------------------
+# 4. Run ML model and print anomalies
+# --------------------------------------------------
 def detect_anomalies(features, ip_list):
-    """Run Isolation Forest and print anomalies."""
-    if len(features) < 2:   # need at least 2 samples for isolation forest
-        return
+    if len(features) < 2:
+        return  # need at least 2 samples
     model = IsolationForest(contamination=0.2, random_state=42)
-    predictions = model.fit_predict(features)   # -1 = anomaly, 1 = normal
-    for ip, pred in zip(ip_list, predictions):
+    predictions = model.fit_predict(features)  # -1 = anomaly
+    for ip, pred, feat in zip(ip_list, predictions, features):
         if pred == -1:
-            # Optional: add rule-based check to reduce false positives
-            # For example: high unique ports = port scan
-            # We'll simply print the IP as anomalous
-            print(f"[!] ANOMALY DETECTED: {ip} (features: {features[ip_list.index(ip)]})")
+            # filter out weak anomalies (reduce false positives)
+            if feat[2] > 20 or feat[1] > 30:
+                print(
+                    f"[!] ALERT: {ip} | packets={feat[0]}, ports={feat[1]}, rate={feat[2]:.1f}/s"
+                )
 
-def packet_callback(packet):
-    """Called for every captured packet."""
-    if IP in packet:
-        src_ip = packet[IP].src
-        # Update stats
-        ip_stats[src_ip]['packets'] += 1
-        if TCP in packet:
-            ip_stats[src_ip]['ports'].add(packet[TCP].dport)
-        elif UDP in packet:
-            ip_stats[src_ip]['ports'].add(packet[UDP].dport)
 
-# ------------------------------------------------------------------
-# 2. Main loop: capture packets and run detection every WINDOW seconds
-# ------------------------------------------------------------------
+# --------------------------------------------------
+# 5. Main loop
+# --------------------------------------------------
 def start_detection(interface=None):
-    print(f"Starting anomaly detection (window = {WINDOW}s). Press Ctrl+C to stop.")
-    last_check = time.time()
-    # Start sniffing in a non‑blocking way? We'll use a simple loop with timeout.
-    # Sniff with timeout to periodically run ML.
+    print(f"Monitoring every {WINDOW}s. Press Ctrl+C to stop.")
     while True:
-        # Capture packets for `WINDOW` seconds, then run detection
+        # capture packets for WINDOW seconds
         sniff(iface=interface, prn=packet_callback, timeout=WINDOW, store=0)
-        # After the window, extract features and detect anomalies
-        features, ip_list = extract_features()
+        # now analyse
+        features, ip_list = get_features()
         detect_anomalies(features, ip_list)
-        # Reset stats for next window
+        # reset for next window
         ip_stats.clear()
 
+
 if __name__ == "__main__":
-    # Optional: specify network interface (e.g., 'eth0', 'Wi-Fi', or None for default)
-    start_detection(interface=None)
+    start_detection()
